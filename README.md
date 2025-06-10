@@ -33,13 +33,9 @@ While the conversion process was meticulous and the model passes basic generatio
 
 A primary motivation for creating this model is to serve as a high-quality "student" model for future research. The plan is to perform **knowledge and logit distillation** from the much larger `Qwen/Qwen3-235B-A22B` Mixture-of-Experts (MoE) model. By using this 72B model as a base, we aim to distill the specialized knowledge and reasoning capabilities of the 235B MoE model into a more efficient, dense architecture.
 
-> **Change:** Merged "Model Description" and "Future Work" for a clearer narrative flow.
-
 ---
 
-## A Meticulous Conversion Process
-
-> **Change:** New title highlights the quality of the process.
+## Conversion Process
 
 This model is a "hybrid conversion" created using a robust script that prioritizes correctness, transparency, and safety. The key steps were:
 
