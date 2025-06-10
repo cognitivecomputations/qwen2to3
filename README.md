@@ -21,8 +21,6 @@ While the conversion process was meticulous and the model passes basic generatio
 
 **Use this model with a clear understanding of these limitations, primarily for research and experimentation.**
 
-> **Reasoning:** The disclaimer is now much more specific and actionable. It directly addresses the excellent points your friend raised (long-context, quantization, benchmarks), which builds trust and helps users make informed decisions.
-
 ---
 
 ## Model Purpose and Motivation
