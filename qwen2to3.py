@@ -3,10 +3,11 @@
 import torch
 import os
 import json
+import re # <-- Import the regular expression module
 from datetime import datetime
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
-from transformers import Qwen3Config, Qwen3ForCausalLM # We only need these for creating the *target* model shell.
+from transformers import Qwen3Config, Qwen3ForCausalLM
 from collections import Counter
 
 # --- Helper Functions (Definitive Version) ---
@@ -20,45 +21,24 @@ def create_vocab_mapping(s_tok, t_tok):
     return mapping
 
 def verify_special_tokens(s_tok, t_tok, mapping):
-    """
-    Corrected version that handles both string and list values in special_tokens_map.
-    """
     print("\nVerifying special token mappings...")
     for name, token_value in t_tok.special_tokens_map.items():
-        
-        # This helper function processes a single token string
         def _process_token(token_str):
-            if token_str and token_str in t_tok.get_vocab(): # Check if token_str is not None or empty
+            if token_str and token_str in t_tok.get_vocab():
                 t_id = t_tok.convert_tokens_to_ids(token_str)
                 s_id = mapping.get(t_id, -1)
                 status = f"Mapped (T: {t_id} -> S: {s_id})" if s_id != -1 else "NOT FOUND in source (initialized with mean)"
                 print(f"  ✓ ('{token_str}'): {status}")
-
-        # Check if the value from the map is a string or a list
-        if isinstance(token_value, str):
-            _process_token(token_value)
+        if isinstance(token_value, str): _process_token(token_value)
         elif isinstance(token_value, list):
-            for token_str_in_list in token_value:
-                _process_token(token_str_in_list)
+            for token_str_in_list in token_value: _process_token(token_str_in_list)
 
 def create_hybrid_matrix(s_matrix, mapping, shape):
-    """
-    Creates the hybrid embedding matrix.
-    - For tokens present in both, it uses the source embedding.
-    - For new tokens, it initializes with the mean of all source embeddings.
-    """
     print("  -> Calculating mean embedding from source model for new token initialization...")
-    # Calculate the mean of the source embeddings on CPU to use for initialization
     mean_embedding = s_matrix.mean(dim=0, keepdim=True)
-    
     hybrid = torch.zeros(shape, dtype=s_matrix.dtype, device='cpu')
     for t_id, s_id in mapping.items():
-        if s_id != -1:
-            hybrid[t_id] = s_matrix[s_id]
-        else:
-            # For new tokens, use the pre-calculated mean embedding
-            hybrid[t_id] = mean_embedding
-            
+        hybrid[t_id] = s_matrix[s_id] if s_id != -1 else mean_embedding
     return hybrid.to(s_matrix.device)
 
 def save_config_diff(s_conf, t_conf, path):
@@ -66,18 +46,14 @@ def save_config_diff(s_conf, t_conf, path):
     diff = {'changed': {}, 'added': {}, 'removed': {}}
     for k in set(s_dict.keys()) | set(t_dict.keys()):
         if s_dict.get(k) != t_dict.get(k):
-            if k in s_dict and k in t_dict:
-                diff['changed'][k] = {'from': s_dict[k], 'to': t_dict[k]}
-            elif k in t_dict:
-                diff['added'][k] = t_dict[k]
-            else:
-                diff['removed'][k] = s_dict[k]
+            if k in s_dict and k in t_dict: diff['changed'][k] = {'from': s_dict[k], 'to': t_dict[k]}
+            elif k in t_dict: diff['added'][k] = t_dict[k]
+            else: diff['removed'][k] = s_dict[k]
     with open(os.path.join(path, "config_diff.json"), "w") as f: json.dump(diff, f, indent=2)
 
 def validate_model(path):
     print("\n[Step 6/6] Validating final model (smoke test)...")
     try:
-        # Using AutoModelForCausalLM here is the ultimate test of portability!
         tokenizer = AutoTokenizer.from_pretrained(path)
         model = AutoModelForCausalLM.from_pretrained(path, device_map="auto", torch_dtype=torch.bfloat16)
         model.eval()
@@ -97,7 +73,7 @@ def validate_model(path):
 def convert_qwen2_to_qwen3_decoupled():
     source_model_id, donor_model_id = "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen3-32B"
     target_model_path = "./Qwen3-72B"
-    print("Starting DECOUPLED conversion process (v5.2)...")
+    print("Starting DECOUPLED conversion process (v5.3)...")
 
     # --- 1. Pre-flight Checks ---
     print("\n[Step 1/6] Running pre-flight architectural checks...")
@@ -119,8 +95,7 @@ def convert_qwen2_to_qwen3_decoupled():
     # --- 3. Create Target Config & Initialize ---
     print("\n[Step 3/6] Creating target Qwen3 72B config & initializing model shell...")
     t_config = Qwen3Config(hidden_size=s_config.hidden_size, intermediate_size=s_config.intermediate_size, num_hidden_layers=s_config.num_hidden_layers, num_attention_heads=s_config.num_attention_heads, num_key_value_heads=s_config.num_key_value_heads, max_position_embeddings=s_config.max_position_embeddings, max_window_layers=s_config.max_window_layers, sliding_window=s_config.sliding_window, attention_bias=d_config.attention_bias, hidden_act=d_config.hidden_act, initializer_range=d_config.initializer_range, rms_norm_eps=d_config.rms_norm_eps, rope_theta=d_config.rope_theta, vocab_size=d_config.vocab_size, tie_word_embeddings=True)
-    with torch.device("meta"): 
-        t_model = Qwen3ForCausalLM(t_config)
+    with torch.device("meta"): t_model = Qwen3ForCausalLM(t_config)
 
     # --- 4. Convert and Transfer Weights ---
     print("\n[Step 4/6] Converting weights (memory-safe)...")
@@ -131,8 +106,19 @@ def convert_qwen2_to_qwen3_decoupled():
     verify_special_tokens(s_tokenizer, t_tokenizer, vocab_mapping)
     
     new_state_dict = {}
+    num_donor_layers = d_config.num_hidden_layers
+    
     for key in tqdm(t_model.state_dict().keys(), desc="Transferring weights"):
-        if "q_norm" in key or "k_norm" in key: new_state_dict[key] = d_state_dict[key].clone()
+        if "q_norm" in key or "k_norm" in key:
+            # --- FIX: Implement Cyclical Grafting for Norm Layers ---
+            match = re.search(r'layers\.(\d+)\.', key)
+            if match:
+                target_layer_idx = int(match.group(1))
+                donor_layer_idx = target_layer_idx % num_donor_layers
+                donor_key = key.replace(f'layers.{target_layer_idx}.', f'layers.{donor_layer_idx}.')
+                new_state_dict[key] = d_state_dict[donor_key].clone()
+            else:
+                print(f"  ⚠️ Could not parse layer index for norm key: {key}. Skipping.")
         elif "model.embed_tokens.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
         elif "lm_head.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
         elif key in s_state_dict: new_state_dict[key] = s_state_dict[key].clone()
