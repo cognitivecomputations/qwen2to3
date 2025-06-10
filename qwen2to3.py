@@ -1,3 +1,5 @@
+# file: convert_qwen2.5_to_qwen3_final_decoupled.py
+
 import torch
 import os
 import json
@@ -7,7 +9,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 from transformers import Qwen3Config, Qwen3ForCausalLM # We only need these for creating the *target* model shell.
 from collections import Counter
 
-# --- Helper Functions ---
+# --- Helper Functions (Definitive Version) ---
 
 def create_vocab_mapping(s_tok, t_tok):
     s_vocab, t_vocab = s_tok.get_vocab(), t_tok.get_vocab()
@@ -18,18 +20,45 @@ def create_vocab_mapping(s_tok, t_tok):
     return mapping
 
 def verify_special_tokens(s_tok, t_tok, mapping):
+    """
+    Corrected version that handles both string and list values in special_tokens_map.
+    """
     print("\nVerifying special token mappings...")
-    for name, token in t_tok.special_tokens_map.items():
-        if token in t_tok.get_vocab():
-            t_id = t_tok.convert_tokens_to_ids(token)
-            s_id = mapping.get(t_id, -1)
-            status = f"Mapped (T: {t_id} -> S: {s_id})" if s_id != -1 else "NOT FOUND in source (will use donor)"
-            print(f"  ✓ {name} ('{token}'): {status}")
+    for name, token_value in t_tok.special_tokens_map.items():
+        
+        # This helper function processes a single token string
+        def _process_token(token_str):
+            if token_str and token_str in t_tok.get_vocab(): # Check if token_str is not None or empty
+                t_id = t_tok.convert_tokens_to_ids(token_str)
+                s_id = mapping.get(t_id, -1)
+                status = f"Mapped (T: {t_id} -> S: {s_id})" if s_id != -1 else "NOT FOUND in source (initialized with mean)"
+                print(f"  ✓ ('{token_str}'): {status}")
 
-def create_hybrid_matrix(s_matrix, d_matrix, mapping, shape):
+        # Check if the value from the map is a string or a list
+        if isinstance(token_value, str):
+            _process_token(token_value)
+        elif isinstance(token_value, list):
+            for token_str_in_list in token_value:
+                _process_token(token_str_in_list)
+
+def create_hybrid_matrix(s_matrix, mapping, shape):
+    """
+    Creates the hybrid embedding matrix.
+    - For tokens present in both, it uses the source embedding.
+    - For new tokens, it initializes with the mean of all source embeddings.
+    """
+    print("  -> Calculating mean embedding from source model for new token initialization...")
+    # Calculate the mean of the source embeddings on CPU to use for initialization
+    mean_embedding = s_matrix.mean(dim=0, keepdim=True)
+    
     hybrid = torch.zeros(shape, dtype=s_matrix.dtype, device='cpu')
     for t_id, s_id in mapping.items():
-        hybrid[t_id] = s_matrix[s_id].to('cpu') if s_id != -1 else d_matrix[t_id].to('cpu')
+        if s_id != -1:
+            hybrid[t_id] = s_matrix[s_id]
+        else:
+            # For new tokens, use the pre-calculated mean embedding
+            hybrid[t_id] = mean_embedding
+            
     return hybrid.to(s_matrix.device)
 
 def save_config_diff(s_conf, t_conf, path):
@@ -68,7 +97,7 @@ def validate_model(path):
 def convert_qwen2_to_qwen3_decoupled():
     source_model_id, donor_model_id = "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen3-32B"
     target_model_path = "./Qwen3-72B"
-    print("Starting DECOUPLED conversion process (v5.0)...")
+    print("Starting DECOUPLED conversion process (v5.2)...")
 
     # --- 1. Pre-flight Checks ---
     print("\n[Step 1/6] Running pre-flight architectural checks...")
@@ -82,7 +111,6 @@ def convert_qwen2_to_qwen3_decoupled():
     # --- 2. Load Models & Tokenizers using AutoModel ---
     print("\n[Step 2/6] Loading models & tokenizers using standard AutoClasses...")
     dtype = torch.bfloat16
-    # No local code needed! `AutoModelForCausalLM` dispatches to the correct built-in architecture.
     s_model = AutoModelForCausalLM.from_pretrained(source_model_id, torch_dtype=dtype, device_map="auto")
     d_model = AutoModelForCausalLM.from_pretrained(donor_model_id, torch_dtype=dtype, device_map="auto")
     s_tokenizer = AutoTokenizer.from_pretrained(source_model_id)
@@ -105,8 +133,8 @@ def convert_qwen2_to_qwen3_decoupled():
     new_state_dict = {}
     for key in tqdm(t_model.state_dict().keys(), desc="Transferring weights"):
         if "q_norm" in key or "k_norm" in key: new_state_dict[key] = d_state_dict[key].clone()
-        elif "model.embed_tokens.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], d_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
-        elif "lm_head.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], d_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
+        elif "model.embed_tokens.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
+        elif "lm_head.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
         elif key in s_state_dict: new_state_dict[key] = s_state_dict[key].clone()
         else: print(f"  ⚠️ Unhandled key: {key} (not in source, skipping)")
 
@@ -116,7 +144,6 @@ def convert_qwen2_to_qwen3_decoupled():
     # --- 5. Save Final Model & Metadata ---
     print("\n[Step 5/6] Saving final model and supporting files...")
     if not os.path.exists(target_model_path): os.makedirs(target_model_path)
-    # When saving, we also save the config, which correctly sets `model_type` to "qwen3"
     t_model.save_pretrained(target_model_path, safe_serialization=True)
     t_tokenizer.save_pretrained(target_model_path)
     save_config_diff(s_config, t_config, target_model_path)
