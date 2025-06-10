@@ -1,205 +1,100 @@
-# file: qwen2to3.py
+# Qwen3-72B: A Community-Created Hybrid Model
 
+**Model ID:** `YourHuggingFaceUsername/Qwen3-72B`  
+**Model Type:** Causal Language Model  
+**Architecture:** Qwen3
+
+---
+
+## 🚨 Disclaimer 🚨
+
+This model, `Qwen3-72B`, is an **experimental, community-created model**. It was not trained from scratch by the original Qwen team. It has been constructed by merging weights from `Qwen/Qwen2.5-72B-Instruct` into the `Qwen3` architecture, using `Qwen/Qwen3-32B` as a "donor" for architectural components not present in Qwen2.5.
+
+While it has passed basic validation checks, its performance, stability, and safety have not been rigorously evaluated. **Use this model with caution and for research purposes.**
+
+---
+
+## Model Description
+
+`Qwen3-72B` is a 72-billion parameter, decoder-only language model designed to be architecturally compatible with the Qwen3 family of models. It aims to combine the extensive knowledge of the powerful `Qwen2.5-72B-Instruct` model with the architectural improvements of the Qwen3 series.
+
+This model is intended for users who wish to explore a 72B-scale model within the Qwen3 framework. It should be capable of strong performance in a variety of natural language tasks, including chat, instruction following, and content generation.
+
+## How This Model Was Created
+
+This model is a "hybrid conversion" created using a meticulous weight-merging process. The key steps were:
+
+1.  **Base Model**: The primary weights were taken from `Qwen/Qwen2.5-72B-Instruct`. This includes the transformer blocks (attention and MLP layers).
+
+2.  **Donor Model**: The architectural template and new components were taken from `Qwen/Qwen3-32B`.
+
+3.  **Architectural Conversion**:
+    *   **Attention Layers**: The `q_proj`, `k_proj`, and `v_proj` layers were adapted to the Qwen3 standard. Biases were removed, and the new `q_norm` and `k_norm` RMSNorm layers were added, with their weights initialized directly from the `Qwen3-32B` donor model.
+    *   **Vocabulary & Embeddings**: The model uses the official `Qwen3` tokenizer and its vocabulary size of **151,936**. The `embed_tokens` and `lm_head` weight matrices were reconstructed using a hybrid approach:
+        *   For tokens present in both the Qwen2.5 and Qwen3 vocabularies, the corresponding learned embedding vectors from the 72B source model were preserved and mapped to their new positions.
+        *   For tokens unique to the Qwen3 vocabulary, the embedding vectors were initialized from the 32B donor model.
+    *   **Metadata**: The conversion process, including vocabulary overlap statistics, has been documented in the `conversion_metadata.json` file in this repository.
+
+This process ensures full compatibility with the `Qwen3` tokenizer and `transformers` ecosystem while maximizing the knowledge transfer from the original 72B model.
+
+## How to Use
+
+To use this model, you need the `transformers` library and the custom modeling code provided. Ensure you have `trust_remote_code=True` set when loading the model.
+
+```python
 import torch
-import os
-import json
-from datetime import datetime
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Import the custom modeling files provided
-from modeling_qwen2 import Qwen2ForCausalLM
-from modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config
+# Make sure you have the modeling_qwen3.py file in your working directory
+# or have it registered with AutoModel.
 
-# --- Helper Functions (with enhancements) ---
+model_id = "YourHuggingFaceUsername/Qwen3-72B" # Replace with the actual model ID
+dtype = torch.bfloat16
 
-def create_vocab_mapping(source_tokenizer, target_tokenizer):
-    """Creates a mapping from target vocab IDs to source vocab IDs."""
-    source_vocab = source_tokenizer.get_vocab()
-    target_vocab = target_tokenizer.get_vocab()
-    source_token_to_id = {token: idx for token, idx in source_vocab.items()}
-    
-    mapping = {}
-    for token, target_idx in target_vocab.items():
-        mapping[target_idx] = source_token_to_id.get(token, -1)
-        
-    matches = sum(1 for v in mapping.values() if v != -1)
-    print(f"Vocabulary overlap: {matches}/{len(target_vocab)} tokens ({matches/len(target_vocab)*100:.1f}%) will be transferred.")
-    return mapping
+# Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-def verify_special_tokens(source_tokenizer, target_tokenizer, vocab_mapping):
-    """Verifies that special tokens are correctly mapped."""
-    print("\nVerifying special token mappings...")
-    # Use the official special_tokens_map to be robust
-    for token_name, token_str in target_tokenizer.special_tokens_map.items():
-        if token_str in target_tokenizer.get_vocab():
-            target_id = target_tokenizer.convert_tokens_to_ids(token_str)
-            source_id = vocab_mapping.get(target_id, -1)
-            if source_id != -1:
-                print(f"  ✓ {token_name} ('{token_str}'): Mapped correctly (Target ID: {target_id} -> Source ID: {source_id})")
-            else:
-                print(f"  ⚠️ {token_name} ('{token_str}'): Not found in source vocab. Will be initialized from donor.")
-        else:
-             print(f"  - {token_name} ('{token_str}'): Not in target vocabulary.")
+# Load the model
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=dtype,
+    device_map="auto",
+    trust_remote_code=True,
+)
 
+# --- Generation Example ---
+prompt = "Hey, are you conscious? Can you talk to me?"
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-def create_hybrid_weight_matrix(source_matrix, donor_matrix, vocab_mapping, target_shape):
-    """
-    Creates a new weight matrix on CPU to conserve VRAM, then moves it to the target device.
-    This is a memory-efficient implementation of the hybrid transfer logic.
-    """
-    print(f"    Creating new matrix with target shape: {target_shape}")
-    # Force creation on CPU to avoid spiking VRAM. This is a more efficient approach than chunking.
-    hybrid_matrix = torch.zeros(target_shape, dtype=source_matrix.dtype, device='cpu')
-    
-    transferred_from_source = 0
-    used_from_donor = 0
-    
-    for target_idx, source_idx in vocab_mapping.items():
-        if source_idx != -1:
-            hybrid_matrix[target_idx] = source_matrix[source_idx].to('cpu')
-            transferred_from_source += 1
-        else:
-            hybrid_matrix[target_idx] = donor_matrix[target_idx].to('cpu')
-            used_from_donor += 1
-            
-    print(f"    Transferred {transferred_from_source} vectors from source model.")
-    print(f"    Initialized {used_from_donor} new vectors from donor model.")
-    # Move the final, consolidated matrix to the source device in one go.
-    return hybrid_matrix.to(source_matrix.device)
+# Generate text
+outputs = model.generate(**inputs, max_new_tokens=50)
+response = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def validate_model(model_path):
-    """Loads the newly saved model and performs a quick generation test."""
-    print("\n[Step 6/6] Validating the final converted model...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        model = Qwen3ForCausalLM.from_pretrained(model_path, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
-        model.eval()
+print(response)
+# Expected output similar to:
+# Hey, are you conscious? Can you talk to me?
+# I am not conscious, but I can talk to you. I am a large language model, trained by Alibaba Cloud.
+```
 
-        prompt = "The capital of France is"
-        print(f"Validation Prompt: '{prompt}'")
-        
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=10, do_sample=False)
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Generated Response: '{response}'")
-        
-        if len(response) > len(prompt):
-             print("  ✓ Validation successful: Model generated output.")
-        else:
-             print("  ✗ Validation failed: Model did not generate new tokens.")
+### Hardware Requirements
 
-    except Exception as e:
-        print(f"\nAn error occurred during validation: {e}")
-        print("  ✗ Validation failed.")
+This is a very large model. To run it effectively, you will need:
+-   **VRAM**: Approximately 160 GB for full precision, or ~80 GB for 4-bit quantized inference (e.g., 2x A100 40GB or 1x A100/H100 80GB).
+-   **Libraries**: `transformers`, `torch`, `accelerate`, `bitsandbytes` (for quantization).
 
+## Model Architecture Details
 
-# --- Main Conversion Logic ---
+-   **Model Type**: `qwen3`
+-   **Hidden Size**: 8192
+-   **Intermediate Size**: 29568
+-   **Number of Layers**: 80
+-   **Attention Heads**: 64
+-   **KV Heads**: 8 (Grouped-Query Attention)
+-   **Vocabulary Size**: 151,936
+-   **Max Position Embeddings**: 32768
+-   **Sliding Window Attention**: Enabled on specified layers
 
-def convert_qwen2_to_qwen3_final():
-    source_model_id = "Qwen/Qwen2.5-72B-Instruct"
-    donor_model_id = "Qwen/Qwen3-32B"
-    target_model_path = "./Qwen3-72B"
+This model features Grouped-Query Attention (GQA) for faster inference and a sliding window attention mechanism to handle long contexts efficiently.
 
-    print(f"Starting FINAL conversion process...")
-    
-    # --- 1. Load Models & Tokenizers ---
-    print("\n[Step 1/6] Loading source and donor models & tokenizers...")
-    dtype = torch.bfloat16
-    source_model = Qwen2ForCausalLM.from_pretrained(source_model_id, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
-    donor_model = Qwen3ForCausalLM.from_pretrained(donor_model_id, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
-    source_tokenizer = AutoTokenizer.from_pretrained(source_model_id, trust_remote_code=True)
-    target_tokenizer = AutoTokenizer.from_pretrained(donor_model_id, trust_remote_code=True)
-    
-    # --- 2. Create Target Config ---
-    print("\n[Step 2/6] Creating target Qwen3 72B configuration...")
-    source_config = source_model.config
-    donor_config = donor_model.config
-    target_config = Qwen3Config(
-        hidden_size=source_config.hidden_size, intermediate_size=source_config.intermediate_size,
-        num_hidden_layers=source_config.num_hidden_layers, num_attention_heads=source_config.num_attention_heads,
-        num_key_value_heads=source_config.num_key_value_heads, max_position_embeddings=source_config.max_position_embeddings,
-        max_window_layers=source_config.max_window_layers, sliding_window=source_config.sliding_window,
-        attention_bias=donor_config.attention_bias, hidden_act=donor_config.hidden_act,
-        initializer_range=donor_config.initializer_range, rms_norm_eps=donor_config.rms_norm_eps,
-        rope_theta=donor_config.rope_theta, vocab_size=donor_config.vocab_size, 
-        tie_word_embeddings=True, model_type="qwen3",
-    )
-
-    # --- 3. Initialize Target Model Shell ---
-    print("\n[Step 3/6] Initializing empty target Qwen3-72B model...")
-    with torch.device("meta"):
-        target_model = Qwen3ForCausalLM(target_config)
-
-    # --- 4. Convert and Transfer Weights ---
-    print("\n[Step 4/6] Converting and transferring weights with alignment...")
-    source_state_dict = source_model.state_dict()
-    donor_state_dict = donor_model.state_dict()
-    target_state_dict = target_model.state_dict()
-    new_state_dict = {}
-
-    vocab_mapping = create_vocab_mapping(source_tokenizer, target_tokenizer)
-    verify_special_tokens(source_tokenizer, target_tokenizer, vocab_mapping)
-    print("") # Newline for cleaner output
-
-    for key in tqdm(target_state_dict.keys(), desc="Transferring weights"):
-        param = target_state_dict[key]
-        if "self_attn.q_norm.weight" in key or "self_attn.k_norm.weight" in key:
-            new_state_dict[key] = donor_state_dict[key].clone()
-        elif "model.embed_tokens.weight" in key:
-            new_state_dict[key] = create_hybrid_weight_matrix(
-                source_matrix=source_state_dict[key], donor_matrix=donor_state_dict["model.embed_tokens.weight"],
-                vocab_mapping=vocab_mapping, target_shape=(target_config.vocab_size, target_config.hidden_size)
-            )
-        elif "lm_head.weight" in key:
-            new_state_dict[key] = create_hybrid_weight_matrix(
-                source_matrix=source_state_dict[key], donor_matrix=donor_state_dict["lm_head.weight"],
-                vocab_mapping=vocab_mapping, target_shape=(target_config.vocab_size, target_config.hidden_size)
-            )
-        elif key in source_state_dict and source_state_dict[key].shape == param.shape:
-            new_state_dict[key] = source_state_dict[key].clone()
-        else:
-            print(f"!! Unhandled or Mismatched Key: '{key}'")
-
-    target_model.load_state_dict(new_state_dict, strict=True, assign=True)
-    target_model = target_model.to(dtype)
-    print("Weight conversion complete.")
-
-    # --- 5. Save Final Model & Metadata ---
-    print("\n[Step 5/6] Saving the final model, tokenizer, and metadata...")
-    if not os.path.exists(target_model_path):
-        os.makedirs(target_model_path)
-    
-    target_model.save_pretrained(target_model_path, safe_serialization=True)
-    target_tokenizer.save_pretrained(target_model_path)
-    
-    # Save metadata for reproducibility
-    conversion_metadata = {
-        "conversion_date_utc": datetime.utcnow().isoformat(),
-        "source_model": source_model_id,
-        "donor_model": donor_model_id,
-        "target_model_path": target_model_path,
-        "vocab_overlap_stats": {
-            "total_target_tokens": len(target_tokenizer),
-            "transferred_from_source": sum(1 for v in vocab_mapping.values() if v != -1),
-            "initialized_from_donor": sum(1 for v in vocab_mapping.values() if v == -1)
-        },
-        "script_version": "2.0_final"
-    }
-    with open(os.path.join(target_model_path, "conversion_metadata.json"), "w") as f:
-        json.dump(conversion_metadata, f, indent=2)
-
-    print(f"✅ Model saved to: {target_model_path}")
-    
-    # --- 6. Final Validation ---
-    # We release the memory of the large models before loading the new one for validation
-    del source_model, donor_model, source_state_dict, donor_state_dict, new_state_dict, target_model
-    torch.cuda.empty_cache()
-    
-    validate_model(target_model_path)
-
-
-if __name__ == "__main__":
-    convert_qwen2_to_qwen3_final()
+---
+*This model was created using community-developed scripts. Credit to the original Qwen team at Alibaba Cloud for their foundational models.*
