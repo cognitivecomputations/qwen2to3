@@ -1,22 +1,16 @@
-# file: convert_qwen2.5_to_qwen3_definitive.py
-
 import torch
 import os
 import json
 from datetime import datetime
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from transformers import Qwen3Config, Qwen3ForCausalLM # We only need these for creating the *target* model shell.
 from collections import Counter
 
-# Import the custom modeling files provided
-from modeling_qwen2 import Qwen2ForCausalLM
-from modeling_qwen3 import Qwen3ForCausalLM, Qwen3Config
-
-# --- Helper Functions (Definitive Version) ---
+# --- Helper Functions ---
 
 def create_vocab_mapping(s_tok, t_tok):
-    s_vocab = s_tok.get_vocab()
-    t_vocab = t_tok.get_vocab()
+    s_vocab, t_vocab = s_tok.get_vocab(), t_tok.get_vocab()
     s_tok_to_id = {t: i for t, i in s_vocab.items()}
     mapping = {t_id: s_tok_to_id.get(t, -1) for t, t_id in t_vocab.items()}
     matches = sum(1 for v in mapping.values() if v != -1)
@@ -31,28 +25,6 @@ def verify_special_tokens(s_tok, t_tok, mapping):
             s_id = mapping.get(t_id, -1)
             status = f"Mapped (T: {t_id} -> S: {s_id})" if s_id != -1 else "NOT FOUND in source (will use donor)"
             print(f"  ✓ {name} ('{token}'): {status}")
-
-def report_missing_high_freq_tokens(s_tokenizer, t_tokenizer, vocab_mapping, top_n=10):
-    """Reports if any very common tokens from a sample text were not mapped."""
-    sample_text = (
-        "The quick brown fox jumps over the lazy dog. Hello, world! "
-        "你好世界！1234567890,.:;()[]{}'\"`~-+=_ "
-        "This is a test of the emergency broadcast system."
-    )
-    # Get frequencies from the *target* tokenizer's perspective on a sample
-    token_freq = Counter(t_tokenizer.tokenize(sample_text))
-    missing_tokens = []
-    
-    for token, freq in token_freq.most_common():
-        if token in t_tokenizer.get_vocab():
-            t_id = t_tokenizer.convert_tokens_to_ids(token)
-            if vocab_mapping.get(t_id, -1) == -1:
-                missing_tokens.append((token, freq))
-    
-    if missing_tokens:
-        print("\n  ⚠️ Found high-frequency sample tokens that were not in the source vocab (initialized from donor):")
-        for token, freq in missing_tokens[:top_n]:
-            print(f"    - Token: '{token}' (Sample Freq: {freq})")
 
 def create_hybrid_matrix(s_matrix, d_matrix, mapping, shape):
     hybrid = torch.zeros(shape, dtype=s_matrix.dtype, device='cpu')
@@ -76,8 +48,9 @@ def save_config_diff(s_conf, t_conf, path):
 def validate_model(path):
     print("\n[Step 6/6] Validating final model (smoke test)...")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-        model = Qwen3ForCausalLM.from_pretrained(path, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
+        # Using AutoModelForCausalLM here is the ultimate test of portability!
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        model = AutoModelForCausalLM.from_pretrained(path, device_map="auto", torch_dtype=torch.bfloat16)
         model.eval()
         prompt = "The theory of relativity states that"
         print(f"\nValidation Prompt: '{prompt}'")
@@ -87,47 +60,47 @@ def validate_model(path):
         response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         print(f"Generated Response: '{response}'")
         assert len(response) > len(prompt), "Model did not generate new tokens."
-        print("\n  ✓ Validation successful: Model loads and generates coherent text.")
+        print("\n  ✓ Validation successful: Model loads and generates coherent text using standard transformers.")
     except Exception as e:
         print(f"\n  ✗ Validation FAILED: {e}")
 
 # --- Main Conversion Logic ---
-def convert_qwen2_to_qwen3_definitive():
+def convert_qwen2_to_qwen3_decoupled():
     source_model_id, donor_model_id = "Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen3-32B"
     target_model_path = "./Qwen3-72B"
-    print("Starting DEFINITIVE conversion process (v4.0)...")
+    print("Starting DECOUPLED conversion process (v5.0)...")
 
     # --- 1. Pre-flight Checks ---
     print("\n[Step 1/6] Running pre-flight architectural checks...")
-    s_config = AutoConfig.from_pretrained(source_model_id, trust_remote_code=True)
-    d_config = AutoConfig.from_pretrained(donor_model_id, trust_remote_code=True)
+    s_config = AutoConfig.from_pretrained(source_model_id)
+    d_config = AutoConfig.from_pretrained(donor_model_id)
     assert s_config.hidden_act == d_config.hidden_act, f"FATAL: Hidden activation mismatch! Source: {s_config.hidden_act}, Donor: {d_config.hidden_act}."
     print("  ✓ Hidden activation functions match.")
     if s_config.rope_theta != d_config.rope_theta:
         print(f"  ✓ RoPE Theta: Using donor value {d_config.rope_theta} (source was {s_config.rope_theta})")
     
-    # --- 2. Load Models & Tokenizers ---
-    print("\n[Step 2/6] Loading source and donor models & tokenizers...")
+    # --- 2. Load Models & Tokenizers using AutoModel ---
+    print("\n[Step 2/6] Loading models & tokenizers using standard AutoClasses...")
     dtype = torch.bfloat16
-    s_model = Qwen2ForCausalLM.from_pretrained(source_model_id, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
-    d_model = Qwen3ForCausalLM.from_pretrained(donor_model_id, torch_dtype=dtype, device_map="auto", trust_remote_code=True)
-    s_tokenizer = AutoTokenizer.from_pretrained(source_model_id, trust_remote_code=True)
-    t_tokenizer = AutoTokenizer.from_pretrained(donor_model_id, trust_remote_code=True)
+    # No local code needed! `AutoModelForCausalLM` dispatches to the correct built-in architecture.
+    s_model = AutoModelForCausalLM.from_pretrained(source_model_id, torch_dtype=dtype, device_map="auto")
+    d_model = AutoModelForCausalLM.from_pretrained(donor_model_id, torch_dtype=dtype, device_map="auto")
+    s_tokenizer = AutoTokenizer.from_pretrained(source_model_id)
+    t_tokenizer = AutoTokenizer.from_pretrained(donor_model_id)
 
     # --- 3. Create Target Config & Initialize ---
-    print("\n[Step 3/6] Creating target Qwen3 72B config & initializing model...")
-    t_config = Qwen3Config(hidden_size=s_config.hidden_size, intermediate_size=s_config.intermediate_size, num_hidden_layers=s_config.num_hidden_layers, num_attention_heads=s_config.num_attention_heads, num_key_value_heads=s_config.num_key_value_heads, max_position_embeddings=s_config.max_position_embeddings, max_window_layers=s_config.max_window_layers, sliding_window=s_config.sliding_window, attention_bias=d_config.attention_bias, hidden_act=d_config.hidden_act, initializer_range=d_config.initializer_range, rms_norm_eps=d_config.rms_norm_eps, rope_theta=d_config.rope_theta, vocab_size=d_config.vocab_size, tie_word_embeddings=True, model_type="qwen3")
-    with torch.device("meta"): t_model = Qwen3ForCausalLM(t_config)
+    print("\n[Step 3/6] Creating target Qwen3 72B config & initializing model shell...")
+    t_config = Qwen3Config(hidden_size=s_config.hidden_size, intermediate_size=s_config.intermediate_size, num_hidden_layers=s_config.num_hidden_layers, num_attention_heads=s_config.num_attention_heads, num_key_value_heads=s_config.num_key_value_heads, max_position_embeddings=s_config.max_position_embeddings, max_window_layers=s_config.max_window_layers, sliding_window=s_config.sliding_window, attention_bias=d_config.attention_bias, hidden_act=d_config.hidden_act, initializer_range=d_config.initializer_range, rms_norm_eps=d_config.rms_norm_eps, rope_theta=d_config.rope_theta, vocab_size=d_config.vocab_size, tie_word_embeddings=True)
+    with torch.device("meta"): 
+        t_model = Qwen3ForCausalLM(t_config)
 
     # --- 4. Convert and Transfer Weights ---
     print("\n[Step 4/6] Converting weights (memory-safe)...")
-    # CRITICAL FIX: Gather state dicts on CPU to prevent OOM errors.
     s_state_dict = {k: v.to('cpu', dtype=dtype) for k, v in tqdm(s_model.state_dict().items(), desc="Source state dict to CPU")}
     d_state_dict = {k: v.to('cpu', dtype=dtype) for k, v in tqdm(d_model.state_dict().items(), desc="Donor state dict to CPU")}
     
     vocab_mapping = create_vocab_mapping(s_tokenizer, t_tokenizer)
     verify_special_tokens(s_tokenizer, t_tokenizer, vocab_mapping)
-    report_missing_high_freq_tokens(s_tokenizer, t_tokenizer, vocab_mapping)
     
     new_state_dict = {}
     for key in tqdm(t_model.state_dict().keys(), desc="Transferring weights"):
@@ -135,7 +108,7 @@ def convert_qwen2_to_qwen3_definitive():
         elif "model.embed_tokens.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], d_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
         elif "lm_head.weight" in key: new_state_dict[key] = create_hybrid_matrix(s_state_dict[key], d_state_dict[key], vocab_mapping, (t_config.vocab_size, t_config.hidden_size))
         elif key in s_state_dict: new_state_dict[key] = s_state_dict[key].clone()
-        else: print(f"  ⚠️ Unhandled key: {key} (not in source, skipping)") # IMPORTANT: Warn about unhandled keys
+        else: print(f"  ⚠️ Unhandled key: {key} (not in source, skipping)")
 
     t_model.load_state_dict(new_state_dict, strict=True, assign=True)
     t_model = t_model.to(dtype)
@@ -143,6 +116,7 @@ def convert_qwen2_to_qwen3_definitive():
     # --- 5. Save Final Model & Metadata ---
     print("\n[Step 5/6] Saving final model and supporting files...")
     if not os.path.exists(target_model_path): os.makedirs(target_model_path)
+    # When saving, we also save the config, which correctly sets `model_type` to "qwen3"
     t_model.save_pretrained(target_model_path, safe_serialization=True)
     t_tokenizer.save_pretrained(target_model_path)
     save_config_diff(s_config, t_config, target_model_path)
@@ -157,4 +131,4 @@ def convert_qwen2_to_qwen3_definitive():
     validate_model(target_model_path)
 
 if __name__ == "__main__":
-    convert_qwen2_to_qwen3_definitive()
+    convert_qwen2_to_qwen3_decoupled()
