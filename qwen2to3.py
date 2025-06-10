@@ -1,5 +1,3 @@
-# file: convert_qwen2.5_to_qwen3_final.py
-
 import torch
 import os
 import json
