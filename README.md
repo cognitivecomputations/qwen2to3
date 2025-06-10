@@ -48,8 +48,6 @@ This model is a "hybrid conversion" created using a robust script that prioritiz
     *   `conversion_metadata.json`: Documents the conversion process and important warnings.
     *   `config_diff.json`: A machine-readable diff of the changes between the source and final model configurations.
 
-> **Reasoning:** This section now "sells" the quality of your work. It mentions the pre-flight checks and the provenance files (`metadata.json`, `config_diff.json`), showing that this wasn't just a casual merge but a careful engineering task.
-
 ---
 
 ## How to Use
