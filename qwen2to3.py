@@ -101,7 +101,7 @@ def validate_model(model_path):
 def convert_qwen2_to_qwen3_final():
     source_model_id = "Qwen/Qwen2.5-72B-Instruct"
     donor_model_id = "Qwen/Qwen3-32B"
-    target_model_path = "./Qwen3-72B"
+    target_model_path = "./Qwen3-72B-Instruct"
 
     print(f"Starting FINAL conversion process...")
     
@@ -129,7 +129,7 @@ def convert_qwen2_to_qwen3_final():
     )
 
     # --- 3. Initialize Target Model Shell ---
-    print("\n[Step 3/6] Initializing empty target Qwen3-72B model...")
+    print("\n[Step 3/6] Initializing empty target Qwen3-72B-Instruct model...")
     with torch.device("meta"):
         target_model = Qwen3ForCausalLM(target_config)
 
