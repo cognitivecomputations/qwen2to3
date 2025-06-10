@@ -10,8 +10,6 @@ Created by Eric Hartford
 
 ## 🚨 Disclaimer & Known Limitations 🚨
 
-> **Change:** Title is more specific.
-
 This model, `Qwen3-72B-Instruct`, is an **experimental, community-created model**. It was not trained or fine-tuned by the original Qwen team. It has been constructed by merging weights from `Qwen/Qwen2.5-72B-Instruct` into the `Qwen3` architecture.
 
 While the conversion process was meticulous and the model passes basic generation tests, it comes with specific limitations that users must be aware of:
